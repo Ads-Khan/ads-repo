@@ -1,0 +1,61 @@
+SET NOCOUNT ON;
+
+SELECT  [StartTime]
+       ,convert(varchar, [StartTime], 103) + right(convert(varchar(32),[StartTime],120),9) as 'StartTime(UTC)'
+       ,convert(varchar, [EndTime], 103) + right(convert(varchar(32),[EndTime],120),9) as 'EndTime(UTC)'
+       ,convert(varchar(8), dateadd(second, datediff(second,[StartTime], [EndTime]),0), 108) as 'Duration'
+	   ,(case
+         when [AudioSenderIsCallerPAI] = 0 then 'Callee > Caller'
+         when [AudioSenderIsCallerPAI] = 1 then 'Caller > Callee'
+         end) as 'AudioStream'
+        ,[CallerURI] as 'Caller'
+        ,[CalleeURI] as 'Callee'
+	    ,[CallerSubnet]
+        ,[CallerIPAddr]
+        ,(case
+          when [CallerNetworkConnectionType] = 0 then 'Wired'
+		  when [CallerNetworkConnectionType] = 1 then 'Wi-Fi'
+		  when [CallerNetworkConnectionType] = 2 then 'Ethernet'
+	      end) as 'CallerConnection'
+	    ,[CallerEndpoint]
+	    ,[CallerUserAgent]
+	    ,[CalleeIPAddr]
+       ,(case
+         when [CalleeNetworkConnectionType] = 0 then 'Wired'
+		 when [CalleeNetworkConnectionType] = 1 then 'Wi-Fi'
+		 when [CalleeNetworkConnectionType] = 2 then 'Ethernet'
+	     end) as 'CalleeConnection'
+	   ,[CalleeEndpoint]
+	   ,[CalleeUserAgent]
+	   ,[AudioCodec]
+	   ,[AudioSampleRate]
+	   ,[AudioFECUsed]
+	   ,[AudioRoundTrip] as 'RoundTrip (ms)'
+	   ,[RoundTripOptimal] as 'RoundTripOptimal'
+	   ,[RoundTripAcceptable] as 'RoundTripAcceptable'
+       ,[AudioDegradationAvg] as 'Degradation (MOS)'
+	   ,cast([DegradationAvgOptimal] as decimal(3,2)) as 'DegradationOptimal'
+	   ,cast([DegradationAvgAcceptable] as decimal(3,2)) as 'DegradationAcceptable'
+	   ,cast(cast([AudioPacketLossRate] as float) * 100 as decimal(5,2)) as 'PacketLoss (%)'
+	   ,cast(cast([PacketLossRateOptimal] as float) * 100 as decimal(5,2)) as 'PacketLossOptimal'
+       ,cast(cast([PacketLossRateAcceptable] as float) * 100 as decimal(5,2)) as 'PacketLossAcceptable'
+	   ,[AudioJitterInterArrival] as 'Jitter (ms)'
+       ,[JitterInterArrivalOptimal] as 'JitterOptimal'
+       ,[JitterInterArrivalAcceptable] 'JitterAcceptable'
+	   ,[AudioRatioConcealedSamplesAvg] as 'HealerConcealedRatio'
+       ,cast([RatioConcealedSamplesAvgOptimal] as decimal(3,2)) as 'HCROptimal'
+	   ,cast([RatioConcealedSamplesAvgAcceptable] as decimal(3,2)) as 'HCRAcceptable'
+  INTO #a
+  FROM [qoemetrics].[dbo].[QoEReportsCallDetailView] CDV
+  WHERE StartTime >= '2017-09-09 01:00' 
+  AND StartTime < '2017-10-09 02:00'
+  AND (([CallerUAType] >= 16399 and [CallerUAType] <= 16403) 
+       OR ([CalleeUAType] >= 16399 and [CalleeUAType] <= 16403)
+  )
+  ORDER BY [StartTime(UTC)], AudioStream DESC
+  
+  SELECT [IsPSTNCall],[IsConfCall],[IsUCCall], * FROM #a CDV
+  LEFT JOIN [qoemetrics].[dbo].[QoEReportsCallListView] CLV
+       ON CDV.[StartTime] = CLV.[StartTime]
+
+  DROP Table #a

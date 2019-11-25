@@ -1,0 +1,766 @@
+﻿
+<#
+
+.SYNOPSIS 
+    Applicable Call Quality Monitoring (CQM) Regular Data Extract (RDE) Report.
+
+.DESCRIPTION
+	Executes SQL queries against QoEMetrics DBs for Lync/SfB pool monitoring stores to extract PSTN,
+	Conference and P2P calls marked as 'Poor' by the application and uploads them into the Customer's 
+	SharePoint Portal for sharing.
+	
+	The script is designed to be called from a Scheduled Task but can be called from an interactive PS console for
+	troubleshooting purposes. It logs standard Applicable 1001, 1008 and 1009 events to the Application logs 
+	using 'Applicable' as the event source for Events Management alerting (when not running interactively).
+	
+	For further details please review the following Process documents:
+	4971 - Applicable Call Quality Monitoring Regular Data Extract Reporting
+	4970 - Applicable Call Quality Reporting Regular Data Extract Reporting Deployment Guide
+	4748 - Applicable Scripting Alerts (Event ID 1008)
+	
+.EXAMPLE
+    .\Invoke-AppCQMRegularDataExtract.ps1 [-AddSPCredentials] [-SPUploadOnly] [-ReportsOnly]
+	
+.INPUTS
+	None
+	
+.OUTPUTS
+	[PS Object]
+
+.NOTES
+	Copyright Applicable 2016
+	AUTHOR: Mohammad Jameel <mohammad.jameel@applicable.com>
+	
+	Change Log
+	v1.0 - 31 May 2017 - M Jameel - Initial. 
+	
+#>
+
+#Requires -Version 3.0
+
+[CmdletBinding()]
+
+Param (
+
+	# Tells the script to add new hash credentials for SP Username and Password into settings.xml
+	[switch]$AddSPCredentials,
+
+	# Tells the script to just try the SharePoint Upload function without running reports. Useful for troubleshooting SP Portal related issues.
+	[switch]$SPUploadOnly,
+	
+	# Tells the script to just run reports and skip the SharePoint upload. Useful for for troubleshooting issues related to generating the reports.
+	[switch]$ReportsOnly	
+)
+
+Function Get-CQMSettings {
+
+    Param (
+  
+       [Parameter(Mandatory=$True)]
+       [string]$Path
+    )
+
+	$script:functionName = $MyInvocation.MyCommand.Name
+	Get-Content -Path $Path -ErrorAction Stop
+}
+
+Function Test-CQMReportRuntime {
+
+    Param (
+  
+       [Parameter(Mandatory=$True)]
+       [int]$RunHourInterval
+    )
+		
+	# Build Runtime Hours List (RHL) from specified interval
+	$RHL = @()
+	
+	For ($hr=0;$hr -lt 24;$hr+=$RunHourInterval) {
+		$RHL += $hr.ToString("00")
+	}
+
+	[datetime]$Now = Get-Date
+	[string]$NowHour = "{0:HH}" -f $Now	
+	
+	[bool]$RunReport = $RHL.Contains($NowHour)
+	$RunReport
+	
+} # End Function
+
+Function Get-CQMConnectionString {
+
+	# Get the Monitoring DB Stores from settings
+	$stores = $xCQM.GetElementsByTagName('Store')
+
+	$stores | ForEach {    
+	
+		# Add Primary SQL Server
+		[string]$Conn = $($_.SQLServer.Fqdn)
+		# Add Primary SQL Instance
+		If ($_.SQLServer.Instance) {$Conn += "\$($_.SQLServer.Instance)"}
+		# Add Failover Partner
+		If ($_.MirrorSQLServer.Fqdn) {$Conn += ";Failover Partner=$($_.MirrorSQLServer.Fqdn)"}
+		# Add Failover Partner Instance
+		If ($_.MirrorSQLServer.Instance) {$Conn += "\$($_.MirrorSQLServer.Instance)"}
+	
+		$tblConn = [ordered]@{
+		"ConnectionString" = $Conn
+		}
+
+		[pscustomobject]$tblConn
+
+	}# End ForEach
+	
+}# End Function
+
+Function Get-CQMModalitySQLQueryString {
+
+    Param (
+	
+		[Parameter(Mandatory=$True)]
+        [string]$Modality
+	)
+
+[string]$q = @'
+SET NOCOUNT ON;
+
+SELECT  [ClassifiedPoorCall] as 'IsPoorCall'
+
+'@
+
+Switch ($Modality) {
+		
+'Conf' {
+
+$q += @'
+	   ,[IsConfCall]
+  
+'@
+}
+
+'P2P' {
+
+$q += @'
+	   ,[IsUCCall]
+  
+'@
+}
+
+'PSTN' {
+
+$q += @'
+	   ,(case 
+	     when CLV.[MediationServerBypassFlag] = 1 then 1
+		 else [IsPSTNCall]
+		 end) as 'IsPSTNCall'
+       ,CLV.[MediationServerBypassFlag] as 'MediaBypass'
+  
+'@
+}		
+			
+		
+default {
+}
+
+
+
+}# End Switch
+
+
+
+
+$q += @'
+	   ,[CallInside]
+	   ,[CallVPN]
+	   
+'@
+
+If ($Modality -eq 'PSTN') {
+
+$q += @'
+	   ,(case
+		 when CDV.[CallerUAType] = 1 And CDV.[CalleeUAType] = 16393 then 'Mediation Server-ExchangeUM'
+	     when CDV.[CallerUAType] = 1 And CDV.[CalleeUAType] = 32769 then 'Mediation Server-Gateway'
+		 when CDV.[CallerUAType] = 32769  And CDV.[CalleeUAType] = 1 then 'Mediation Server-Gateway'
+	     when CDV.[MediationServerBypassFlag] = 1 then 'UC-Gateway'				
+		 else 'UC-Mediation Server'
+		 end) as 'Leg'
+		 
+'@
+}
+
+$q += @'
+       ,convert(varchar, CLV.[StartTime], 103) + right(convert(varchar(32),CLV.[StartTime],120),9) as 'StartTime(UTC)'
+       ,convert(varchar, CLV.[EndTime], 103) + right(convert(varchar(32),CLV.[EndTime],120),9) as 'EndTime(UTC)'
+       ,convert(varchar(8), dateadd(second, datediff(second,CLV.[StartTime], CLV.[EndTime]),0), 108) as 'Duration'
+	   ,(case
+        when [AudioSenderIsCallerPAI] = 0 then 'Callee > Caller'
+        when [AudioSenderIsCallerPAI] = 1 then 'Caller > Callee'
+        end) as 'AudioStream'
+		
+'@
+
+If ($Modality -eq 'PSTN') {
+
+$q += @'
+       ,(case
+	     when CHARINDEX(';',[CallerURI]) <> 0 then LEFT([CallerURI],CHARINDEX(';',[CallerURI])-1)
+	     else [CallerURI]
+	     end) as 'Caller'
+       ,(case
+	     when CHARINDEX(';',[CalleeURI]) <> 0 then LEFT([CalleeURI],CHARINDEX(';',[CalleeURI])-1)
+	     else [CalleeURI]
+	     end) as 'Callee'
+		 
+'@
+} else {
+
+$q += @'
+       ,[CallerURI] as 'Caller'
+       ,[CalleeURI] as 'Callee'
+	   
+'@
+
+}
+
+$q += @'
+       ,[CallerIPAddr]
+       ,(case
+         when [CallerNetworkConnectionType] = 0 then 'Wired'
+		 when [CallerNetworkConnectionType] = 1 then 'Wi-Fi'
+		 when [CallerNetworkConnectionType] = 2 then 'Ethernet'
+	     end) as 'CallerConnection'
+	   ,CDV.[CallerEndpoint]
+	   ,CDV.[CallerUserAgent]
+	   ,[CalleeIPAddr]
+       ,(case
+         when [CalleeNetworkConnectionType] = 0 then 'Wired'
+		 when [CalleeNetworkConnectionType] = 1 then 'Wi-Fi'
+		 when [CalleeNetworkConnectionType] = 2 then 'Ethernet'
+	     end) as 'CalleeConnection'
+	   ,CDV.[CalleeEndpoint]
+	   ,CDV.[CalleeUserAgent]
+	   ,[AudioCodec]
+	   ,[AudioSampleRate]
+	   ,[AudioFECUsed]
+	   ,[AudioRoundTrip] as 'RoundTrip (ms)'
+	   ,CLV.[RoundTripOptimal] as 'RoundTripOptimal'
+	   ,CLV.[RoundTripAcceptable] as 'RoundTripAcceptable'
+       ,CLV.[DegradationAvg] as 'Degradation (MOS)'
+	   ,cast(CLV.[DegradationAvgOptimal] as decimal(3,2)) as 'DegradationOptimal'
+	   ,cast(CLV.[DegradationAvgAcceptable] as decimal(3,2)) as 'DegradationAcceptable'
+	   ,cast(cast([AudioPacketLossRate] as float) * 100 as decimal(5,2)) as 'PacketLoss (%)'
+	   ,cast(cast(CLV.[PacketLossRateOptimal] as float) * 100 as decimal(5,2)) as 'PacketLossOptimal'
+       ,cast(cast(CLV.[PacketLossRateAcceptable] as float) * 100 as decimal(5,2)) as 'PacketLossAcceptable'
+	   ,CLV.[JitterInterArrival] as 'Jitter (ms)'
+       ,CLV.[JitterInterArrivalOptimal] as 'JitterOptimal'
+       ,CLV.[JitterInterArrivalAcceptable] 'JitterAcceptable'
+	   ,CLV.[RatioConcealedSamplesAvg] as 'HealerConcealedRatio'
+       ,cast(CLV.[RatioConcealedSamplesAvgOptimal] as decimal(3,2)) as 'HCROptimal'
+	   ,cast(CLV.[RatioConcealedSamplesAvgAcceptable] as decimal(3,2)) as 'HCRAcceptable'
+  INTO #pc
+  FROM [QoEMetrics].[dbo].[QoEReportsCallListView] CLV
+  INNER JOIN [qoemetrics].[dbo].[QoEReportsCallDetailView] CDV
+  ON CLV.StartTime = CDV.StartTime
+  WHERE ClassifiedPoorCall = 1
+  AND (CLV.StartTime >= @_StartTime AND CLV.StartTime < @_EndTime)
+  AND MediaLineLabel = 0 -- Audio
+  AND (PacketLossRate > 0.1 OR DegradationAvg > 1.0 OR RoundTrip > 500 OR JitterInterArrival > 30 OR RatioConcealedSamplesAvg > 0.07) -- MS CQM Poor Stream Condition
+
+'@
+
+Switch ($Modality) {
+		
+'Conf' {
+
+$q += @'
+  AND IsConfCall = 1
+  AND CDV.[CallerUAType] <> 1
+  AND CDV.[CallerUAType] <> 32769  
+  
+'@
+}
+
+'P2P' {
+
+$q += @'
+  AND (IsUCCall = 1 and CLV.MediationServerBypassFlag = 0)
+  
+'@
+}
+
+'PSTN' {
+
+$q += @'
+  AND (
+  IsPSTNCall = 1 OR (IsUCCall = 1 and CLV.MediationServerBypassFlag = 1) -- Include Media Bypass calls
+  )
+  AND CLV.CalleeUserAgent NOT LIKE '%Conferencing_Attendant%'
+  
+'@
+}		
+			
+		
+default {
+}
+
+
+
+}# End Switch
+
+$q += @'
+SELECT * FROM #pc
+
+'@
+
+# Add Filters
+$xCQM.GetElementsByTagName('Filter') | ForEach {$q += $($_.'#cdata-section')}
+
+# Close statement
+$q += @'
+
+ORDER BY 'StartTime(UTC)', AudioStream DESC
+  
+DROP table #pc
+
+'@
+
+# return query string
+$q
+
+} # End Function
+
+Function Unprotect-CQMCredential {
+
+    Param (
+  
+       [Parameter(Mandatory=$True)]
+       [string]$Credential
+    )
+  
+    $pwd = $null
+    $user = 'dummy'
+    $credManager = $null
+	$script:functionName = $MyInvocation.MyCommand.Name
+	
+
+	$c = ConvertTo-SecureString -string $Credential -ErrorAction Stop
+    $credManager =  New-Object System.Management.Automation.PSCredential($user, $c)
+    $credManager.GetNetworkCredential().Password
+	
+
+} # End Function
+
+Function Invoke-CQMSQLQuery {
+
+    Param (
+
+	[Parameter(Mandatory=$True)]
+    [string]$ConnectionString,
+  
+    [Parameter(Mandatory=$True)]
+    [string]$Modality
+    )
+	
+	$Query = Get-CQMModalitySQLQueryString -Modality $Modality
+	$script:functionName = $MyInvocation.MyCommand.Name
+	
+	# Set the time window for the query from the RHI
+	$d = Get-Date
+	$To = $d.ToUniversalTime()
+	$From = $To.AddHours(-$RHI)
+	
+	# Build the report file name in the format
+	$ReportName = ($ConnectionString.Split('.')[0]).ToUpper()
+	$ReportName += "-"+$From.ToString("yyyyMMdd_HH")+"00"
+	$ReportName += "-"+$To.ToString("yyyyMMdd_HH")+"00"
+	$ReportName += "PoorCall$Modality.csv"
+	
+    # Convert times to strings for SQL query
+    $StartTime = $From.ToString("yyyy-MM-dd HH:00")
+    $EndTime = $To.ToString("yyyy-MM-dd HH:00")
+	
+    [int]$rows = 0
+    $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+    $SqlConnection.ConnectionString = "Server=$ConnectionString;Database=QoEMetrics;Integrated Security=True"
+		
+    $SqlCmd = $SqlConnection.CreateCommand()
+    $SqlCmd.CommandText = $Query
+    $SqlCmd.CommandTimeout = 60
+    $SqlCmd.Connection = $SqlConnection
+
+    # Add parameters to pass values to the query
+    $SqlCmd.Parameters.AddWithValue("@_StartTime", $StartTime) | Out-Null
+    $SqlCmd.Parameters.AddWithValue("@_EndTime", $EndTime) | Out-Null
+  
+    # Get the data
+    $SqlAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
+    $SqlAdapter.SelectCommand = $SqlCmd
+    $DataSet = New-Object System.Data.DataSet
+
+    # Start a stopwatch to measure queries
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+   
+	$rows = $SqlAdapter.Fill($DataSet)
+	$SqlConnection.Close()
+	
+	# Stop timer
+	$sw.Stop()
+	$timetaken = "{0:N2}" -f $sw.Elapsed.TotalSeconds
+	
+	$r = "[$rows] records returned (in $timetaken seconds)"
+		
+	#-- Save Report if results are returned
+	If ($rows) {
+				
+		# Build the full path for output
+		$ReportFullPath = $ReportFolder+"\"+$ReportName
+				
+		#-- Write the data
+		$DataSet.Tables[0] | Export-Csv -Path $ReportFullPath -NoTypeInformation
+	}		
+	
+	#Return results
+	$r
+	
+} # End Function
+
+Function Invoke-CQMSPUpload {
+	
+    # Decrypt the credentials
+    $User = Unprotect-CQMCredential -Credential $xCQM.Settings.SharePoint.User
+    $Password = Unprotect-CQMCredential -Credential $xCQM.Settings.SharePoint.Password
+
+	$script:functionName = $MyInvocation.MyCommand.Name
+	
+	# Load CSOM References to SharePoint client assemblies
+	Add-Type -Path ([System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SharePoint.Client").location)
+	Add-Type -Path ([System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SharePoint.Client.runtime").location)
+	
+	Write-Progress -Activity "Uploading Reports to Customer SharePoint Portal [$SiteURL]"
+	Write-Progress -Activity "Uploading Reports to SharePoint Portal" -CurrentOperation "Decrypting Credentials"
+		
+	# Read in the other variables
+	$SiteURL = $xCQM.Settings.SharePoint.SiteURL
+	$DocLibName = $xCQM.Settings.SharePoint.DocLibName
+	$DocLibSubfolderPath = $xCQM.Settings.SharePoint.DocLibSubfolderPath
+  
+	#Bind context to site collection
+    $Context = New-Object Microsoft.SharePoint.Client.ClientContext($SiteURL)
+ 
+    [int]$O365 = $xCQM.Settings.SharePoint.O365 
+	if($O365) {
+        $Creds = New-Object Microsoft.SharePoint.Client.SharePointOnlineCredentials($User,(ConvertTo-SecureString $Password -AsPlainText -Force))
+    } else {
+	    $Creds = New-Object System.Net.NetworkCredential($UserName, (ConvertTo-SecureString $Password -AsPlainText -Force))
+	}
+	
+	$Context.Credentials = $Creds
+	
+    #Load document library root in to context
+    $List = $Context.Web.Lists.GetByTitle($DocLibName)
+    $Context.Load($List)
+    $Context.ExecuteQuery()
+
+		
+	#Load the Library Root Folder
+    $WorkingDocLibFolder = $List.RootFolder
+    $Context.load($WorkingDocLibFolder)
+    $Context.ExecuteQuery()
+
+    # If a subfolder in the document library has been specified set it as the target folder
+    If (![string]::IsNullOrEmpty($DocLibSubfolderPath)) {
+
+        #split the DocLibSubfolderPath passed into chunks (between the slashes) so that we can check if the folder structure exists
+        $SubFolderPathChunks = $DocLibSubfolderPath.substring(1).split("/")
+	
+	    #Load the folders of the root folder into context
+        $Context.load(($WorkingDocLibFolder.folders))
+        $Context.executeQuery()
+	
+        #Loop through the folder chunks, ensuring that the correct folder hierarchy exists in the destination
+        foreach($Chunk in $SubFolderPathChunks) {
+	
+            #Check to find out if a subfolder exists in the current folder that matches the patch chunk being evaluated
+            if($WorkingDocLibFolder.folders | Where {$_.name -eq $Chunk}) {
+
+                #Since we will be evaluating other chunks in the path, set the working folder to the current folder and load this into context.
+                $WorkingDocLibFolder = $WorkingDocLibFolder.folders | Where {$_.name -eq $Chunk}
+                $Context.load($WorkingDocLibFolder)
+                $Context.load($WorkingDocLibFolder.folders)
+                $Context.ExecuteQuery()
+
+            } else {
+                
+				#Create the subfolder
+                Write-Progress -Activity "Uploading Reports to SharePoint Portal" -CurrentOperation "Creating subfolder $Chunk in $($WorkingDocLibFolder.name)"
+                $Context.load($WorkingDocLibFolder)
+                $Context.load($WorkingDocLibFolder.folders)
+                $Context.ExecuteQuery()
+                $WorkingDocLibFolder= $WorkingDocLibFolder.folders.add($Chunk)
+                $Context.load($WorkingDocLibFolder)
+                $Context.load($WorkingDocLibFolder.folders)
+                $Context.ExecuteQuery()		   
+	       }
+	   }
+    }# End If block
+
+   # Upload the reports
+   $Files = Get-ChildItem -Path $ReportFolder | Where {$_.psIsContainer -eq $False}
+   $UploadedFiles = ForEach ($File in ($Files)) {
+
+	  #Get the datastream of the file, assign it to a variable for use by the FileCreationInformation object
+      $FileStream = New-Object IO.FileStream($File.FullName,[System.IO.FileMode]::Open)
+    
+	  #Create and populate an instance of a FileCreationInformation object
+	  $FileCreationInfo = New-Object Microsoft.SharePoint.Client.FileCreationInformation
+      $FileCreationInfo.Overwrite = $true
+      $FileCreationInfo.ContentStream = $FileStream
+      $FileCreationInfo.URL = $File
+
+		Try {
+		
+			#Assign a variable to load into context and upload the file to the destination
+			Write-Progress -Activity "Uploading Reports to SharePoint Portal" -CurrentOperation "Uploading [$($File.Name)]"
+			$Upload = $WorkingDocLibFolder.Files.Add($FileCreationInfo)
+			$Context.Load($Upload)
+			$Context.ExecuteQuery()
+	 
+			# Check in
+			Write-Progress -Activity "Uploading Reports to SharePoint Portal" -CurrentOperation "Checking in [$($File.Name)]"
+			If($Upload.CheckOutType -ne "none")  {
+				$Upload.CheckIn("Checked in by [$AppPSScriptName]", [Microsoft.SharePoint.Client.CheckinType]::MajorCheckIn)
+			}
+
+			$Context.Load($Upload)
+			$Context.ExecuteQuery()
+		
+			# Return the full path of file
+			$File.Fullname
+	
+		}# End Try
+		
+		Catch {
+	    
+			# Catch error if the report has already been uploaded
+			If ("$($_.Exception.Message)" -match 'not checked out') {
+		
+				Write-Warning "[$($File.Name)] is already checked in, SP upload skipped..."
+				$File.Fullname
+				Continue
+			} else {
+	
+				errHandler
+			}	
+		}# End Catch
+		
+	}# End ForEach
+	
+	# Delete successfully uploaded files from the cache
+	If (@($UploadedFiles).Count) {
+		Clear-CQMCache -UploadedFiles $UploadedFiles
+	}
+
+}# End Function
+
+Function Clear-CQMCache {
+
+    Param (
+
+	[Parameter(Mandatory=$True)]
+    [array]$UploadedFiles
+    )
+
+	$script:functionName = $MyInvocation.MyCommand.Name
+	ForEach ($Path in $UploadedFiles) {Remove-Item $Path}
+
+}# End Function
+
+Function Add-CQMSPCredentials {
+	
+	$script:functionName = $MyInvocation.MyCommand.Name
+
+	# Admin Privileges
+	If (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+		errHandler "Insufficent Rights. Please launch Powershell as Administrator and retry."
+	}
+
+	# Get SharePoint username
+	Write-Host -ForegroundColor Gray 'E.g. <UserName>@clouduc.onmicrosoft.com'
+	Write-Host -ForegroundColor Green -NoNewLine "[<UserName>] "
+	Write-Host -ForegroundColor White -NoNewLine "SharePoint Portal UserName: "
+	[String]$SPu = Read-Host
+	# Convert SP username to secure string
+	[Security.SecureString]$secSPu = ConvertTo-SecureString $SPu -AsPlainText -Force
+	
+	# Get SharePoint Password	
+	Write-Host -ForegroundColor Green -NoNewLine "[$SPu] "		
+	Write-Host -ForegroundColor White -NoNewLine "Password: "
+	[Security.SecureString]$secSPp = Read-Host -AsSecureString
+	
+	# Hash
+	[string]$eSPu = ConvertFrom-SecureString $secSPu
+	[string]$eSPp = ConvertFrom-SecureString $secSPp
+	
+	# Add and Save
+	$script:functionName = $MyInvocation.MyCommand.Name	
+	Try {
+	
+		$xCQM.Settings.SharePoint.User = $eSPu
+		$xCQM.Settings.SharePoint.Password = $eSPp
+		$xCQM.Save($settingsPath)
+	}
+	
+	Catch {errHandler}
+	
+	Write-Host -ForegroundColor White "`r`n[$AppPSScriptName] SP Credentials added successfully.`r`n"	
+}
+
+Function Write-AppEventLog {
+
+    Param (
+
+		[Parameter(Mandatory=$False)]
+		[int]$EventId = 1001,
+		
+		[Parameter(Mandatory=$False)]
+		[string]$EntryType = 'Information',
+	
+		[Parameter(Mandatory=$True)]
+		[string]$Message
+    )
+	
+	If ($script:DidError) {
+	
+		$EventId = '1008'
+		$EntryType = 'Error'
+	}
+	
+	If ($NotInteractive) {
+		Write-EventLog -Source 'Applicable' -LogName 'Application' -EventId $EventId -EntryType $EntryType -Message $Message
+	}
+}
+
+Function errHandler {
+
+    Param (
+  
+       [Parameter(Mandatory=$False)]
+       [string]$Message
+    )
+	
+	If ($Message) {$errMsg = $Message} else {
+			$errMsg = "[$AppPSScriptPath] #$($script:functionName): $($_.Exception.Message)"
+	}
+	
+	$script:DidError = $True
+	Write-Host -ForegroundColor Red -BackgroundColor Black $errMsg
+	Write-AppEventLog -Message $errMsg
+	exit
+}
+
+#-- BEGIN
+
+
+Get-CQMModalitySQLQueryString -Modality PSTN
+exit
+
+
+# Running in console?
+$cla = @([Environment]::GetCommandLineArgs())
+[bool]$NotInteractive = (($cla.Contains('-NoProfile')))
+
+# Error Trapping Flag
+[bool]$script:DidError = $False
+
+# Stores the name of the Function being called for error trapping
+[string]$script:functionName
+
+# Store the script name
+[string]$AppPSScriptName = $MyInvocation.MyCommand.Name
+
+# Store Script Path
+[string]$AppPSScriptPath = $MyInvocation.MyCommand.Path
+
+# Reports Cache Folder
+[string]$ReportFolder = "$PSScriptRoot\Reports"
+ 
+# Settings file path
+[string]$settingsPath = "$PSScriptRoot\Settings.xml"
+
+# Load settings 
+try {[xml]$xCQM = Get-CQMSettings -Path $settingsPath}
+Catch {errHandler}
+
+#-- Switch Actions
+# If called with AddSPCredentials switch
+If ($AddSPCredentials) {
+
+	Add-CQMSPCredentials
+    exit
+}
+
+# If called with SPUploadOnly switch
+If ($SPUploadOnly) {
+	
+	Try {Invoke-CQMSPUpload}
+	Catch {errHandler}
+	exit
+}
+
+# Get Report Hour Interval (RHI)
+[int]$RHI = $xCQM.Settings.Extract.HourInterval
+	
+# Should report run?
+If (!(Test-CQMReportRuntime -RunHourInterval $RHI) -And ($NotInteractive)) {exit}
+
+# Event Log - Start
+Write-AppEventLog -Message "[$AppPSScriptPath] Started"
+
+# Build SQL connection strings for Monitoring Stores
+$ConnStings = Get-CQMConnectionString
+
+# Run Reports and display results
+Write-Progress -Activity "Running CQM Reports"
+$ConnStings | Select ConnectionString -Unique | ForEach {
+	
+	$c = $($_.ConnectionString)
+	
+	$xCQM.GetElementsByTagName('Modality')| ForEach {	
+		
+		try {
+		
+			$m = $($_.'#text')
+			Write-Progress -Activity "Running CQM Reports" -CurrentOperation "[$c] $m Report"
+			$tblReportResults = [ordered]@{
+				"ConnectionString" = $c
+				"Modality" = $m
+				"Results" = Invoke-CQMSQLQuery -ConnectionString $c -Modality $m
+			}
+
+			[pscustomobject]$tblReportResults
+		}
+		
+		catch {
+		
+			$script:functionName = $MyInvocation.MyCommand.Name
+			errHandler
+		}
+		
+	}# End ForEach
+
+}# End ForEach
+
+#-- Return Results [PS Object]
+$ReportResults
+
+#-- SP Upload
+If (!$ReportsOnly) {
+
+	Try {Invoke-CQMSPUpload}
+	Catch {errHandler}
+}
+
+# Event Log - Finish
+Write-AppEventLog -EventId 1009 -Message "[$AppPSScriptPath] Completed successfully."
+
